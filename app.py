@@ -2,7 +2,7 @@ import streamlit as st
 import requests
 import folium
 from streamlit_folium import st_folium
-from geopy.geocoders import Nominatim
+from geopy.geocoders import Photon
 from geopy.exc import GeocoderTimedOut
 from datetime import datetime
 import time
@@ -34,7 +34,8 @@ url = 'https://taxifare-812256971571.europe-west1.run.app/'
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_resource
 def get_geocoder():
-    return Nominatim(user_agent="taxifare-predictor-app-v1")
+    # Photon geocoder works better on Streamlit Cloud (no rate limit issues)
+    return Photon(user_agent="taxifare-predictor-app-v1")
 
 def geocode_address(address: str):
     """Convert address to lat/lon coordinates with NYC bias."""
@@ -47,14 +48,19 @@ def geocode_address(address: str):
         
         # Try with NYC context first
         queries = [
-            f"{address}, New York City, NY, USA",
-            f"{address}, Manhattan, NY, USA",
-            f"{address}, New York, USA",
+            f"{address}, New York City, USA",
+            f"{address}, Manhattan, New York, USA",
+            f"{address}, NYC",
             address
         ]
         
         for query in queries:
-            location = geolocator.geocode(query, timeout=10)
+            # Photon supports location_bias for better NYC results
+            location = geolocator.geocode(
+                query, 
+                timeout=10,
+                location_bias=(40.7128, -74.0060)  # NYC center
+            )
             if location:
                 # Verify it's in NYC area (roughly)
                 if 40.5 <= location.latitude <= 41.0 and -74.3 <= location.longitude <= -73.7:
@@ -69,8 +75,16 @@ def geocode_address(address: str):
     except GeocoderTimedOut:
         st.warning("⏱️ Geocoding timed out. Please try again.")
         return None
+    except ConnectionError:
+        st.error("🌐 Geocoding service unavailable. Please enter coordinates manually or try again later.")
+        return None
     except Exception as e:
-        st.warning(f"⚠️ Geocoding error: {str(e)}")
+        # Check if it's a connection-related error
+        error_msg = str(e).lower()
+        if 'connection' in error_msg or 'max retries' in error_msg:
+            st.error("🌐 Cannot connect to geocoding service. Please enter coordinates manually.")
+        else:
+            st.warning(f"⚠️ Geocoding error: {str(e)}")
         return None
 
 def get_address_suggestions(query: str):
@@ -82,26 +96,28 @@ def get_address_suggestions(query: str):
         geolocator = get_geocoder()
         time.sleep(0.1)
         
-        # Search with NYC bias
-        locations = geolocator.geocode(
+        # Search with NYC bias - Photon doesn't support exactly_one=False the same way
+        # So we'll do a single search with location bias
+        location = geolocator.geocode(
             f"{query}, New York City",
-            exactly_one=False,
-            limit=5,
-            timeout=5
+            timeout=5,
+            location_bias=(40.7128, -74.0060),  # NYC center
+            exactly_one=True
         )
         
-        if locations:
-            suggestions = []
-            for loc in locations:
-                if 40.5 <= loc.latitude <= 41.0 and -74.3 <= loc.longitude <= -73.7:
-                    suggestions.append({
-                        'display_name': loc.address,
-                        'lat': loc.latitude,
-                        'lon': loc.longitude
-                    })
-            return suggestions[:5]
+        if location:
+            # Verify it's in NYC area
+            if 40.5 <= location.latitude <= 41.0 and -74.3 <= location.longitude <= -73.7:
+                return [{
+                    'display_name': location.address,
+                    'lat': location.latitude,
+                    'lon': location.longitude
+                }]
+    except (ConnectionError, OSError):
+        # Silent fail for autocomplete - connection issues
+        pass
     except Exception as e:
-        # Silent fail for autocomplete
+        # Silent fail for other autocomplete errors
         pass
     
     return []
@@ -165,17 +181,22 @@ with col_controls:
     
     col_plat, col_plon = st.columns(2)
     with col_plat:
-        st.number_input(
+        pickup_lat = st.number_input(
             "Lat", value=st.session_state.pickup_lat,
             format="%.6f", key="pickup_lat_input", label_visibility="collapsed",
-            disabled=True
+            min_value=40.5, max_value=41.0, step=0.001
         )
     with col_plon:
-        st.number_input(
+        pickup_lon = st.number_input(
             "Lon", value=st.session_state.pickup_lon,
             format="%.6f", key="pickup_lon_input", label_visibility="collapsed",
-            disabled=True
+            min_value=-74.3, max_value=-73.7, step=0.001
         )
+    
+    # Update session state if values changed
+    if pickup_lat != st.session_state.pickup_lat or pickup_lon != st.session_state.pickup_lon:
+        st.session_state.pickup_lat = pickup_lat
+        st.session_state.pickup_lon = pickup_lon
     
     st.markdown("---")
     
@@ -214,17 +235,22 @@ with col_controls:
     
     col_dlat, col_dlon = st.columns(2)
     with col_dlat:
-        st.number_input(
+        dropoff_lat = st.number_input(
             "Lat", value=st.session_state.dropoff_lat,
             format="%.6f", key="dropoff_lat_input", label_visibility="collapsed",
-            disabled=True
+            min_value=40.5, max_value=41.0, step=0.001
         )
     with col_dlon:
-        st.number_input(
+        dropoff_lon = st.number_input(
             "Lon", value=st.session_state.dropoff_lon,
             format="%.6f", key="dropoff_lon_input", label_visibility="collapsed",
-            disabled=True
+            min_value=-74.3, max_value=-73.7, step=0.001
         )
+    
+    # Update session state if values changed
+    if dropoff_lat != st.session_state.dropoff_lat or dropoff_lon != st.session_state.dropoff_lon:
+        st.session_state.dropoff_lat = dropoff_lat
+        st.session_state.dropoff_lon = dropoff_lon
     
     st.markdown("---")
     
@@ -282,7 +308,7 @@ with col_map:
     folium.Marker(
         location=[st.session_state.pickup_lat, st.session_state.pickup_lon],
         popup="🟢 Pickup",
-        tooltip="Pickup",
+        tooltip="Pickup location",
         icon=folium.Icon(color='green', icon='play', prefix='fa'),
     ).add_to(m)
     
@@ -290,16 +316,17 @@ with col_map:
     folium.Marker(
         location=[st.session_state.dropoff_lat, st.session_state.dropoff_lon],
         popup="🔴 Dropoff",
-        tooltip="Dropoff",
+        tooltip="Dropoff location",
         icon=folium.Icon(color='red', icon='stop', prefix='fa'),
     ).add_to(m)
     
-    # Render map
+    # Render map with dynamic key to force refresh when coordinates change
+    map_key = f"map_{st.session_state.pickup_lat:.5f}_{st.session_state.pickup_lon:.5f}_{st.session_state.dropoff_lat:.5f}_{st.session_state.dropoff_lon:.5f}"
     st_folium(
         m,
         width=700,
         height=500,
-        key="nyc_map"
+        key=map_key
     )
     
     # Show current coordinates
